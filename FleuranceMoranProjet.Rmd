@@ -1,0 +1,201 @@
+---
+title: "ProjetFleuranceMoran"
+author: "Gabriel Moran et Paul Fleurance"
+date: "9 décembre 2019"
+geometry: margin=1cm
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+library(glmnet)
+```
+
+\section{Préambule}
+Pour rappel, nous nous intéressons à la construction d'un modèle permettant de prédire la concentration de CO à partir des valeurs des capteurs et autres interférences potentielles. Pour une présentation plus ample des données et du problème envisagé, se référer au document précédent.
+
+\section{Premières approches de construction de modèle}
+Comme expliqué dans le document précédent, les variables explicatives sont fortement corrélées. Cela pose problème puisque, en notant $X$ la concaténation des p variables explicatives, une des hypothèses fondamentales en régression linéaire est l'inversibilité de $X^TX$. Or, lorsque des variables sont fortement corrélées, $X^TX$ se rapproche d'une matrice inversible, ce qui fait diminuer la précision des estimateurs des coefficients du modèle. Nous avons donc envisagé d'utiliser les méthode de pénalisations (Lasso, Ridge et Elastic-Net). Cependant, nous avons tout de même commencer par utiliser la méthode des moindres carrés (MC) pour ensuite tenter une sélection de variables par recherche pas à pas (méthodes "stepwise","backward" et "forward").
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+data <- read.table("data/20160930_203718.csv",header = TRUE,sep = ",") 
+modreg <- lm("CO..ppm.~.",data=data)
+regboth <- step(modreg,direction = 'both',trace=0)                                      
+regback <- step(modreg,direction = 'backward',trace = 0)                                  
+regfor <- step(lm(CO..ppm.~1,data=data),list(upper=modreg),direction = 'forward',trace=0) 
+```
+
+Le modèle construit produit des erreurs de l'ordre de grandeur de la variable cible (CO) et les trois méthodes de sélection de variables sélectionnent l'ensemble des variables, ce qui n'apporte aucune valeur ajoutée. Nous avons donc ensuite utiliser les méthodes de pénalisations (avec un alpha=0.5 pour elastic-net). Or, une validation croisée sur chacun des modèles construits produits des erreurs du même ordre de grandeur que le modèle des moindres carrés, malgrès la forte corrélation des variables explicatives (RMSE est la racine de l'erreur quadratique moyenne):
+
+```{r,echo=FALSE,warning=FALSE}
+n<-dim(data)[1] 
+##K-fold procedure
+modregErrors <- c()                                                             
+lassoErrors <- c()                                                              
+ridgeErrors <- c()                                                              
+elnetErrors <- c()     
+for (i in 0:2){                                                                 
+test_ind <- (i*n/3+1):((i+1)*n/3)                                               
+x.train <- as.matrix(data[-test_ind,-2])                                        
+x.test <- as.matrix(data[test_ind,-2])                                          
+y.train <- as.matrix(data[-test_ind,2])                                         
+y.test <- as.matrix(data[test_ind,2])                                           
+                                                                                
+#Reg model                                                                      
+modreg.fit <- lm("CO..ppm.~.",data=data[-test_ind,])                            
+modreg.predicted <- predict(modreg.fit,newdata = data[test_ind,])               
+modregError <- mean((data[test_ind,2]-modreg.predicted)^2)
+##Ridge                                                                         
+alpha0.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=0,family="gaussian")                                                                        
+alpha0.predicted <- predict(alpha0.fit,alpha0.fit$lambda.1se,newx=x.test)       
+ridgeError <- mean((y.test-alpha0.predicted)^2)                                 
+#Lasso                                                                          
+alpha1.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=1,family="gaussian")                                                                        
+alpha1.predicted <- predict(alpha1.fit,alpha1.fit$lambda.1se,newx=x.test)       
+lassoError <- mean((y.test-alpha1.predicted)^2)      
+#ElasticNet                                                                     
+alpha0.5.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=0.5,family="gaussian")                                                                    
+alpha0.5.predicted <- predict(alpha0.5.fit,alpha0.5.fit$lambda.1se,newx=x.test) 
+elnetError <- mean((y.test-alpha0.5.predicted)^2)                               
+                                                                                
+elnetErrors <- c(elnetErrors,elnetError)                                        
+lassoErrors <- c(lassoErrors,lassoError)                                        
+ridgeErrors <- c(ridgeErrors,ridgeError)                                        
+modregErrors <- c(modregErrors,modregError)                                     
+}
+boxplot(sqrt(modregErrors),sqrt(ridgeErrors),sqrt(lassoErrors),sqrt(elnetErrors),
+        main="Boxplots des RMSE du [CO] estimé par MC et pénalisations",names = c("MC","Ridge","Lasso","Elastic-Net"))    
+```
+
+Par ailleurs, la méthode Lasso, qui favorise l'annulation de certains coefficients, ne fait aucune sélection de variables. Arrivés là, nous nous sommes rendu compte qu'il fallait sérieusement repenser notre modèle, notamment par des pré-traitements de nos données.
+
+\section{Autres approches par pré-traitements}
+Une des caractéristiques principales de nos données est la non-linéarité des signaux des capteurs. Une autre est la forte redondance des données de certaines variables : la température et le flux ne changent que tous les 5s, CO toute les 15 min, la tension du radiateur toute les 25s, et ce pour environ 3 instances par seconde. L'extraction de caractéristiques permettrait de répondre à ces problèmes. Tout d'abord, le radiateur ne sert qu'à déclencher les signaux des capteurs et sa tension n'apporte aucune information. Ensuite, en ce qui concerne les capteurs, l'amplitude des signaux produits résume entièrement l'information utile de ceux-ci. Si nous extrayons les amplitudes des signaux, nous aurons non seulement des données plus interprétables, mais aussi une forte réduction de redondance. Une de nos approches à donc été de fractionner les données par signal, en extraire l'amplitude et de moyenner les autres variables, en éliminant la tension du radiateur.
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+new_r1 <- matrix(apply(matrix(data[1:295650,7],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r2 <- matrix(apply(matrix(data[1:295650,8],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r3 <- matrix(apply(matrix(data[1:295650,9],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r4 <- matrix(apply(matrix(data[1:295650,10],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r5 <- matrix(apply(matrix(data[1:295650,11],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r6 <- matrix(apply(matrix(data[1:295650,12],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r7 <- matrix(apply(matrix(data[1:295650,13],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r8 <- matrix(apply(matrix(data[1:295650,14],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r9 <- matrix(apply(matrix(data[1:295650,15],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r10 <- matrix(apply(matrix(data[1:295650,16],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r11 <- matrix(apply(matrix(data[1:295650,17],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r12 <- matrix(apply(matrix(data[1:295650,18],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r13 <- matrix(apply(matrix(data[1:295650,19],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_r14 <- matrix(apply(matrix(data[1:295650,20],nrow = 90),MARGIN=2,FUN = max),ncol = 1)
+new_time <- matrix(apply(matrix(data[1:295650,1],nrow = 90),MARGIN=2,FUN = mean),ncol = 1)
+new_co <- matrix(apply(matrix(data[1:295650,2],nrow = 90),MARGIN=2,FUN = mean),ncol = 1)
+new_hum <- matrix(apply(matrix(data[1:295650,3],nrow = 90),MARGIN=2,FUN = mean),ncol = 1)
+new_temp <- matrix(apply(matrix(data[1:295650,4],nrow = 90),MARGIN=2,FUN = mean),ncol = 1)
+new_flr <- matrix(apply(matrix(data[1:295650,5],nrow = 90),MARGIN=2,FUN = mean),ncol = 1)
+
+transfdata <- data.frame(cbind(new_time,new_co,new_hum,new_temp,new_flr,new_r1,
+                               new_r2,new_r3,new_r4,new_r5,new_r6,new_r7,new_r8,new_r9,
+                               new_r10,new_r11,new_r12,new_r13,new_r14))
+colnames(transfdata)<-c("Time","CO","Humidity","Temperature","Flow_rate","R1","R2","R3",
+                        "R4","R5","R6","R7","R8","R9","R10","R11","R12","R13","R14")
+```
+
+Une première visualisation de la matrice de corrélation, nous montre une forte réduction de corrélation entre capteurs de différents modèles, ce qui est rassurant, et accentue la corrélation entre les capteurs FIS et [CO] d'une part et Figaro et l'humidité d'autre part. La sélection de variables par recherche pas à pas nous donne pour les trois méthodes un nouveau modèle, constitué de la température, du flux et certains capteurs issus majoritairement du modèle FIS.
+
+```{r,echo=FALSE,warning=FALSE}
+modreg <- lm("CO~.",data=transfdata)                                                    
+regboth <- step(modreg,direction = 'both',trace = 0)                                    
+regback <- step(modreg,direction = 'backward',trace = 0)                                
+regfor <- step(lm(CO~1,data=transfdata),list(upper=modreg),direction = 'forward',trace=0)
+seltransfdata <- transfdata[c("CO","Temperature","Flow_rate","R1","R4","R6","R9","R10",
+                            "R11","R12","R13","R14")]
+```
+
+Par validation croisée, on observe clairement la supériorité du pouvoir prédictif des modèles construits (par MC(M), Ridge(R), Lasso(L) et Elastic-Net(E)) à partir des données transformées (4 du milieu), et encore plus pour les modèles construits uniquement à partir des variables sélectionnées précédemment (4 derniers) :
+
+```{r,echo=FALSE,warning=FALSE}
+##K-fold procedure on seltransfdata (transformed data with selected variables)
+
+n<-dim(seltransfdata)[1] 
+smodregErrors <- c()                                                             
+slassoErrors <- c()                                                              
+sridgeErrors <- c()                                                              
+selnetErrors <- c()     
+for (i in 0:2){                                                                 
+  test_ind <- (i*n/3+1):((i+1)*n/3)                                               
+  x.train <- as.matrix(seltransfdata[-test_ind,-1])                                        
+  x.test <- as.matrix(seltransfdata[test_ind,-1])                                          
+  y.train <- as.matrix(seltransfdata[-test_ind,1])                                         
+  y.test <- as.matrix(seltransfdata[test_ind,1])                                           
+  
+  #Reg model                                                                      
+  modreg.fit <- lm("CO~.",data=seltransfdata[-test_ind,])                            
+  modreg.predicted <- predict(modreg.fit,newdata = seltransfdata[test_ind,])               
+  smodregError <- mean((seltransfdata[test_ind,1]-modreg.predicted)^2)
+  ##Ridge                                                                         
+  alpha0.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=0,family="gaussian")                                                                        
+  alpha0.predicted <- predict(alpha0.fit,alpha0.fit$lambda.1se,newx=x.test)       
+  sridgeError <- mean((y.test-alpha0.predicted)^2)                                 
+  #Lasso                                                                          
+  alpha1.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=1,family="gaussian")                                                                        
+  alpha1.predicted <- predict(alpha1.fit,alpha1.fit$lambda.1se,newx=x.test)       
+  slassoError <- mean((y.test-alpha1.predicted)^2)      
+  #ElasticNet                                                                     
+  alpha0.5.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=0.5,family="gaussian")                                                                    
+  alpha0.5.predicted <- predict(alpha0.5.fit,alpha0.5.fit$lambda.1se,newx=x.test) 
+  selnetError <- mean((y.test-alpha0.5.predicted)^2)                               
+  
+  selnetErrors <- c(selnetErrors,selnetError)                                        
+  slassoErrors <- c(slassoErrors,slassoError)                                        
+  sridgeErrors <- c(sridgeErrors,sridgeError)                                        
+  smodregErrors <- c(smodregErrors,smodregError)                                     
+}
+
+##K-fold procedure on transfdata (only on transformed data)
+n<-dim(transfdata)[1] 
+tmodregErrors <- c()                                                             
+tlassoErrors <- c()                                                              
+tridgeErrors <- c()                                                              
+telnetErrors <- c()     
+for (i in 0:2){                                                                 
+  test_ind <- (i*n/3+1):((i+1)*n/3)                                               
+  x.train <- as.matrix(transfdata[-test_ind,-2])                                        
+  x.test <- as.matrix(transfdata[test_ind,-2])                                          
+  y.train <- as.matrix(transfdata[-test_ind,2])                                         
+  y.test <- as.matrix(transfdata[test_ind,2])                                           
+  
+  #Reg model                                                                      
+  modreg.fit <- lm("CO~.",data=transfdata[-test_ind,])                            
+  modreg.predicted <- predict(modreg.fit,newdata = transfdata[test_ind,])               
+  tmodregError <- mean((transfdata[test_ind,2]-modreg.predicted)^2)
+  ##Ridge                                                                         
+  alpha0.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=0,family="gaussian")                                                                        
+  alpha0.predicted <- predict(alpha0.fit,alpha0.fit$lambda.1se,newx=x.test)       
+  tridgeError <- mean((y.test-alpha0.predicted)^2)                                 
+  #Lasso                                                                          
+  alpha1.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=1,family="gaussian")                                                                        
+  alpha1.predicted <- predict(alpha1.fit,alpha1.fit$lambda.1se,newx=x.test)       
+  tlassoError <- mean((y.test-alpha1.predicted)^2)      
+  #ElasticNet                                                                     
+  alpha0.5.fit <- cv.glmnet(x.train,y.train,type.measure = "mse",alpha=0.5,family="gaussian")                                                                    
+  alpha0.5.predicted <- predict(alpha0.5.fit,alpha0.5.fit$lambda.1se,newx=x.test) 
+  telnetError <- mean((y.test-alpha0.5.predicted)^2)                               
+  
+  telnetErrors <- c(telnetErrors,telnetError)                                        
+  tlassoErrors <- c(tlassoErrors,tlassoError)                                        
+  tridgeErrors <- c(tridgeErrors,tridgeError)                                        
+  tmodregErrors <- c(tmodregErrors,tmodregError)                                     
+}
+boxplot(sqrt(modregErrors),sqrt(ridgeErrors),sqrt(lassoErrors),sqrt(elnetErrors),
+        sqrt(tmodregErrors),sqrt(tridgeErrors),sqrt(tlassoErrors),sqrt(telnetErrors),
+        sqrt(smodregErrors),sqrt(sridgeErrors),sqrt(slassoErrors),sqrt(selnetErrors),
+        main="Boxplots des RMSE du [CO] estimé par MC et pénalisations",names = c("M","R","L","E","M","R","L","E","M","R","L","E"))
+```
+
+Il semblerait que le modèle construit par MC pour les données transformées sur variables sélectionnées ait le meilleur pouvoir prédictif. Nous nous pencherons dès lors sur des possibilités d'autres pré-traitements ainsi que d'autres méthodes de régression en la présence de variables non-linéaires, notamment le KNN ou le groupe-Lasso.
+
+
+
